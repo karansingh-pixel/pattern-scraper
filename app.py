@@ -9,6 +9,7 @@ import json
 import re
 import time
 import random
+import difflib
 from urllib.parse import urljoin, urlparse, quote_plus
 
 app = Flask(__name__)
@@ -18,7 +19,7 @@ FULL_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.5',
-    
+
     'Connection': 'keep-alive',
     'Upgrade-Insecure-Requests': '1',
 }
@@ -84,6 +85,13 @@ FIELD_SELECTORS = {
     ],
 }
 
+# Minimum name-match score (0-1) to ACCEPT a product page found by name.
+# Below this, we report "not found" rather than scrape the wrong product.
+MIN_NAME_MATCH = 0.40
+# If a candidate scores at/above this, accept immediately (strong match).
+STRONG_NAME_MATCH = 0.65
+
+
 def normalize_url(url):
     if not url:
         return None
@@ -92,25 +100,70 @@ def normalize_url(url):
         url = 'https://' + url
     return url
 
-def find_product_url(brand_website, part_number):
-    """Find product page URL from brand website + part number"""
-    brand_url = normalize_url(brand_website)
-    brand_domain = urlparse(brand_url).netloc
 
-    # Search URL strategies — Shopify, WooCommerce, Magento, generic
-    strategies = [
-        f"{brand_url}/search?type=product&options%5Bprefix%5D=last&q={quote_plus(part_number)}",
-        f"{brand_url}/search?type=product&q={quote_plus(part_number)}",
-        f"{brand_url}/search?q={quote_plus(part_number)}",
-        f"{brand_url}/?s={quote_plus(part_number)}&post_type=product",
-        f"{brand_url}/?s={quote_plus(part_number)}",
-        f"{brand_url}/catalogsearch/result/?q={quote_plus(part_number)}",
-        f"{brand_url}/search?query={quote_plus(part_number)}",
-        f"{brand_url}/search?keywords={quote_plus(part_number)}",
-        f"{brand_url}/search?search={quote_plus(part_number)}",
-        f"{brand_url}/search?text={quote_plus(part_number)}",
+def _normalize_text(text):
+    """Lowercase, strip punctuation to spaces, collapse whitespace."""
+    if not text:
+        return ''
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9]+', ' ', text)
+    return ' '.join(text.split())
+
+
+def _name_similarity(target_name, candidate_text):
+    """
+    Score how well a candidate link/title matches the target product name.
+    Returns 0-1. Combines token overlap (Jaccard) with sequence ratio so that
+    both 'same words different order' and 'mostly same string' score well.
+    """
+    a = _normalize_text(target_name)
+    b = _normalize_text(candidate_text)
+    if not a or not b:
+        return 0.0
+
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    if not a_tokens or not b_tokens:
+        return 0.0
+
+    # Jaccard token overlap
+    inter = a_tokens & b_tokens
+    union = a_tokens | b_tokens
+    jaccard = len(inter) / len(union) if union else 0.0
+
+    # How much of the TARGET name is covered by the candidate
+    coverage = len(inter) / len(a_tokens) if a_tokens else 0.0
+
+    # Raw string similarity
+    seq = difflib.SequenceMatcher(None, a, b).ratio()
+
+    # Weighted blend — coverage matters most (did we find the right product?)
+    return (0.45 * coverage) + (0.30 * jaccard) + (0.25 * seq)
+
+
+def _build_search_urls(brand_url, query):
+    q = quote_plus(query)
+    return [
+        f"{brand_url}/search?type=product&options%5Bprefix%5D=last&q={q}",
+        f"{brand_url}/search?type=product&q={q}",
+        f"{brand_url}/search?q={q}",
+        f"{brand_url}/?s={q}&post_type=product",
+        f"{brand_url}/?s={q}",
+        f"{brand_url}/catalogsearch/result/?q={q}",
+        f"{brand_url}/search?query={q}",
+        f"{brand_url}/search?keywords={q}",
+        f"{brand_url}/search?search={q}",
+        f"{brand_url}/search?text={q}",
     ]
 
+
+PRODUCT_LINK_KEYWORDS = ['/products/', '/product/', '/p/', '/item/', '/pdp/']
+EXCLUDE_LINK_KEYWORDS = ['search?', 'category', '?s=', 'catalogsearch',
+                         'cart', 'login', 'account', 'collections/all']
+
+
+def _find_by_part_number(brand_url, brand_domain, part_number):
+    """Original part-number strategy: direct URL guesses + search + match."""
     # Direct URL guesses (skip search entirely if lucky)
     direct_guesses = [
         f"{brand_url}/products/{part_number.lower()}",
@@ -118,8 +171,6 @@ def find_product_url(brand_website, part_number):
         f"{brand_url}/p/{part_number.lower()}",
         f"{brand_url}/items/{part_number.lower()}",
     ]
-
-    # Try direct guesses first
     for guess_url in direct_guesses:
         try:
             resp = requests.get(guess_url, headers=FULL_HEADERS, timeout=8, allow_redirects=True)
@@ -128,15 +179,14 @@ def find_product_url(brand_website, part_number):
         except Exception:
             continue
 
-    # Try search pages
-    for strategy_url in strategies:
+    for strategy_url in _build_search_urls(brand_url, part_number):
         try:
             time.sleep(random.uniform(0.8, 2.0))
             resp = requests.get(strategy_url, headers=FULL_HEADERS, timeout=12, allow_redirects=True)
             if resp.status_code != 200:
                 continue
 
-            soup = BeautifulSoup(resp.text, 'lxml')
+            soup = BeautifulSoup(resp.text, 'html.parser')
             links = soup.find_all('a', href=True)
             if not links:
                 continue
@@ -150,35 +200,117 @@ def find_product_url(brand_website, part_number):
                     full_url = urljoin(brand_url, href)
                     if (brand_domain in full_url and
                             full_url.rstrip('/') != strategy_url.rstrip('/') and
-                            not any(kw in full_url.lower() for kw in
-                                    ['search?', 'category', '?s=', 'catalogsearch', 'cart', 'login', 'account'])):
+                            not any(kw in full_url.lower() for kw in EXCLUDE_LINK_KEYWORDS)):
                         return full_url
 
             # PRIORITY 2: First product-pattern link
-            product_keywords = ['/products/', '/product/', '/p/', '/item/', '/pdp/']
             seen = set()
             for link in links:
                 href = link.get('href', '').strip()
-                if any(kw in href.lower() for kw in product_keywords):
+                if any(kw in href.lower() for kw in PRODUCT_LINK_KEYWORDS):
                     full_url = urljoin(brand_url, href)
                     clean = full_url.split('?')[0]
                     if brand_domain in full_url and clean not in seen:
                         seen.add(clean)
                         return full_url
-
         except Exception:
             continue
 
     return None
 
-def calculate_confidence(value, field_name, part_number, page_text):
+
+def _find_by_name(brand_url, brand_domain, product_name):
+    """
+    Search the brand site by product NAME and pick the best-matching product
+    link by name similarity. Only returns a URL if the best candidate clears
+    MIN_NAME_MATCH — otherwise None (we refuse to guess a wrong product).
+    """
+    best_url = None
+    best_score = 0.0
+
+    for strategy_url in _build_search_urls(brand_url, product_name):
+        try:
+            time.sleep(random.uniform(0.8, 2.0))
+            resp = requests.get(strategy_url, headers=FULL_HEADERS, timeout=12, allow_redirects=True)
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            links = soup.find_all('a', href=True)
+            if not links:
+                continue
+
+            seen = set()
+            for link in links:
+                href = link.get('href', '').strip()
+                if not any(kw in href.lower() for kw in PRODUCT_LINK_KEYWORDS):
+                    continue
+
+                full_url = urljoin(brand_url, href)
+                if brand_domain not in full_url:
+                    continue
+                if any(kw in full_url.lower() for kw in EXCLUDE_LINK_KEYWORDS):
+                    continue
+
+                clean = full_url.split('?')[0]
+                if clean in seen:
+                    continue
+                seen.add(clean)
+
+                # Candidate text = link text, falling back to the URL slug
+                cand_text = link.get_text(strip=True)
+                if len(cand_text) < 3:
+                    slug = urlparse(clean).path.rstrip('/').split('/')[-1]
+                    cand_text = slug.replace('-', ' ').replace('_', ' ')
+
+                score = _name_similarity(product_name, cand_text)
+                if score > best_score:
+                    best_score = score
+                    best_url = full_url
+
+                if best_score >= STRONG_NAME_MATCH:
+                    return best_url
+        except Exception:
+            continue
+
+    if best_score >= MIN_NAME_MATCH:
+        return best_url
+    return None
+
+
+def find_product_url(brand_website, part_number, product_name=''):
+    """
+    Find product page URL from brand website using part number first (most
+    precise), then product name as a fallback.
+    Returns (url, method) where method is 'part_number', 'name', or None.
+    """
+    brand_url = normalize_url(brand_website)
+    if not brand_url:
+        return None, None
+    brand_domain = urlparse(brand_url).netloc
+
+    if part_number:
+        url = _find_by_part_number(brand_url, brand_domain, part_number)
+        if url:
+            return url, 'part_number'
+
+    if product_name:
+        url = _find_by_name(brand_url, brand_domain, product_name)
+        if url:
+            return url, 'name'
+
+    return None, None
+
+
+def calculate_confidence(value, field_name, identifier, page_text):
     if not value or value.strip() == '':
         return 0, 'Not Found'
     score = 50
     value_lower = value.lower()
     if field_name == 'Product Title':
         if 10 <= len(value) <= 200: score += 20
-        if part_number.lower() in value_lower: score += 25
+        # Guard: empty identifier matches every string in Python — never boost on ''
+        if identifier and identifier.lower() in value_lower: score += 25
     elif field_name == 'Description':
         if len(value) > 100: score += 20
         if len(value) > 500: score += 10
@@ -201,6 +333,7 @@ def calculate_confidence(value, field_name, part_number, page_text):
     elif score >= 50: label = '⚠️ Medium'
     else: label = '❌ Low'
     return score, label
+
 
 def scrape_field(soup, field_name, page_url=None):
     """Smart field scraper — works on any website structure"""
@@ -413,6 +546,7 @@ def scrape_field(soup, field_name, page_url=None):
     # Fallback for custom/other fields
     return ''
 
+
 def scrape_custom_field(soup, custom_field_name):
     field_lower = custom_field_name.lower().strip()
     all_text = soup.get_text(separator='\n')
@@ -433,20 +567,36 @@ def scrape_custom_field(soup, custom_field_name):
                     return text[:1000]
     return ''
 
-def scrape_product(part_number, brand_website, product_url, selected_fields, custom_fields):
-    result = {'Part Number': part_number, 'Source URL': '', 'Status': ''}
+
+def scrape_product(part_number, brand_website, product_url, product_name, selected_fields, custom_fields):
+    result = {'Part Number': part_number, 'Product Name': product_name, 'Source URL': '', 'Status': ''}
     all_fields = selected_fields + custom_fields
     for field in all_fields:
         result[field] = ''
         result[f'{field} — Confidence'] = ''
+
+    # Identifier used for the Product Title confidence boost — PN if present, else name
+    identifier = part_number if part_number else product_name
+
     try:
         # Step 1: Get URL
+        method = None
         if product_url and product_url.strip():
             url = normalize_url(product_url.strip())
+            method = 'url'
+        elif not (brand_website and brand_website.strip()):
+            result['Status'] = '❌ Need a Brand Website or a Product URL'
+            return result
         else:
-            url = find_product_url(brand_website, part_number)
+            url, method = find_product_url(brand_website, part_number, product_name)
+
         if not url:
-            result['Status'] = '❌ Product page not found'
+            if part_number and not product_name:
+                result['Status'] = '❌ Not found by part number — add a Product Name or Product URL'
+            elif product_name and not part_number:
+                result['Status'] = '❌ Not found by name — paste the Product URL for this one'
+            else:
+                result['Status'] = '❌ Product page not found'
             return result
         result['Source URL'] = url
 
@@ -457,13 +607,13 @@ def scrape_product(part_number, brand_website, product_url, selected_fields, cus
             result['Status'] = f'❌ HTTP {resp.status_code}'
             return result
 
-        soup = BeautifulSoup(resp.text, 'lxml')
+        soup = BeautifulSoup(resp.text, 'html.parser')
         page_text = soup.get_text()
 
         # Step 3: Scrape fields
         for field in selected_fields:
             value = scrape_field(soup, field, url)
-            score, label = calculate_confidence(value, field, part_number, page_text)
+            score, label = calculate_confidence(value, field, identifier, page_text)
             result[field] = value
             result[f'{field} — Confidence'] = f'{label} ({score}%)'
 
@@ -471,11 +621,17 @@ def scrape_product(part_number, brand_website, product_url, selected_fields, cus
         for field in custom_fields:
             if field.strip():
                 value = scrape_custom_field(soup, field)
-                score, label = calculate_confidence(value, field, part_number, page_text)
+                score, label = calculate_confidence(value, field, identifier, page_text)
                 result[field] = value
                 result[f'{field} — Confidence'] = f'{label} ({score}%)'
 
-        result['Status'] = '✅ Scraped'
+        # Step 5: Status — flag name-matched rows loudly so they get verified
+        if method == 'name':
+            result['Status'] = '⚠️ Scraped — FOUND BY NAME, please verify'
+        elif method == 'url':
+            result['Status'] = '✅ Scraped (direct URL)'
+        else:
+            result['Status'] = '✅ Scraped'
     except requests.exceptions.Timeout:
         result['Status'] = '❌ Timeout — website too slow'
     except requests.exceptions.ConnectionError:
@@ -483,6 +639,7 @@ def scrape_product(part_number, brand_website, product_url, selected_fields, cus
     except Exception as e:
         result['Status'] = f'❌ Error: {str(e)[:50]}'
     return result
+
 
 def create_template_excel():
     wb = openpyxl.Workbook()
@@ -496,8 +653,9 @@ def create_template_excel():
         left=Side(style='thin', color='CCCCCC'), right=Side(style='thin', color='CCCCCC'),
         top=Side(style='thin', color='CCCCCC'), bottom=Side(style='thin', color='CCCCCC')
     )
-    headers = ['Part Number', 'Brand Website', 'Product URL (Optional)']
-    col_widths = [20, 30, 50]
+    # Product Name appended at the END so existing 3-column templates still work.
+    headers = ['Part Number', 'Brand Website', 'Product URL (Optional)', 'Product Name (Optional)']
+    col_widths = [20, 30, 50, 40]
     for col, (header, width) in enumerate(zip(headers, col_widths), 1):
         cell = ws.cell(row=1, column=col, value=header)
         cell.fill = header_fill
@@ -507,7 +665,9 @@ def create_template_excel():
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
     ws.row_dimensions[1].height = 30
     examples = [
-        ['EXAMPLE-001  (Remove this row before upload)', 'brandwebsite.com', 'https://brandwebsite.com/product/example-001  |  Leave blank if you do not have the URL'],
+        ['EXAMPLE-001  (Remove this row before upload)', 'brandwebsite.com',
+         'https://brandwebsite.com/product/example-001  |  Leave blank if you do not have the URL',
+         'Leave blank if you have a Part Number'],
     ]
     for row_idx, example in enumerate(examples, 2):
         for col_idx, value in enumerate(example, 1):
@@ -521,13 +681,18 @@ def create_template_excel():
     instructions = [
         ("Pattern Website Scraper Tool — Template Instructions", True),
         ("", False),
-        ("Column 1 — Part Number: Enter the part number provided by the brand.", False),
-        ("Column 2 — Brand Website: Just the domain, e.g. petsafe.com", False),
-        ("Column 3 — Product URL (Optional): Direct link to product page. Leave blank and the tool will find it!", False),
+        ("You need AT LEAST ONE of: Part Number, Product Name, or Product URL for each row.", True),
         ("", False),
-        ("TIP: Delete the grey example rows before uploading!", True),
+        ("Column 1 — Part Number: The part number from the brand. Best accuracy — use it when you have it.", False),
+        ("Column 2 — Brand Website: Just the domain, e.g. petsafe.com (needed unless you paste a full Product URL).", False),
+        ("Column 3 — Product URL (Optional): Direct link to the product page. If filled, the tool scrapes it directly.", False),
+        ("Column 4 — Product Name (Optional): Use this when the site has NO part number. The tool will search the", False),
+        ("           brand site by name and pick the closest match. Rows found this way are marked", False),
+        ("           '⚠️ FOUND BY NAME, please verify' in the Status column — always double-check those!", False),
+        ("", False),
+        ("TIP: Delete the grey example row before uploading!", True),
     ]
-    ws2.column_dimensions['A'].width = 80
+    ws2.column_dimensions['A'].width = 95
     for row_idx, (text, bold) in enumerate(instructions, 1):
         cell = ws2.cell(row=row_idx, column=1, value=text)
         cell.font = Font(bold=bold, size=10, name="Calibri")
@@ -537,12 +702,13 @@ def create_template_excel():
     output.seek(0)
     return output
 
+
 def create_output_excel(results, selected_fields, custom_fields):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Scraped Data"
     all_fields = selected_fields + [f for f in custom_fields if f.strip()]
-    headers = ['Part Number', 'Status', 'Source URL']
+    headers = ['Part Number', 'Product Name', 'Status', 'Source URL']
     for field in all_fields:
         headers.append(field)
         headers.append(f'{field} — Confidence')
@@ -574,8 +740,7 @@ def create_output_excel(results, selected_fields, custom_fields):
                 if '✅ High' in str(value): cell.fill = high_fill
                 elif '⚠️ Medium' in str(value): cell.fill = medium_fill
                 elif '❌ Low' in str(value): cell.fill = low_fill
-        ws.row_dimensions[row_idx].height = 60
-    col_widths = {'Part Number': 18, 'Status': 20, 'Source URL': 45}
+    col_widths = {'Part Number': 18, 'Product Name': 30, 'Status': 28, 'Source URL': 45}
     for field in all_fields:
         col_widths[field] = 40
         col_widths[f'{field} — Confidence'] = 20
@@ -587,15 +752,18 @@ def create_output_excel(results, selected_fields, custom_fields):
     output.seek(0)
     return output
 
+
 @app.route('/')
 def index():
     return render_template('index.html')
+
 
 @app.route('/download-template')
 def download_template():
     output = create_template_excel()
     return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                      as_attachment=True, download_name='Pattern_Scraper_Template.xlsx')
+
 
 @app.route('/scrape', methods=['POST'])
 def scrape():
@@ -612,24 +780,38 @@ def scrape():
         ws = wb.active
         products = []
         for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[0] and str(row[0]).strip() and 'EXAMPLE' not in str(row[0]).upper():
-                products.append({
-                    'part_number': str(row[0]).strip(),
-                    'brand_website': str(row[1]).strip() if row[1] else '',
-                    'product_url': str(row[2]).strip() if len(row) > 2 and row[2] else '',
-                })
+            part_number = str(row[0]).strip() if len(row) > 0 and row[0] else ''
+            brand_website = str(row[1]).strip() if len(row) > 1 and row[1] else ''
+            product_url = str(row[2]).strip() if len(row) > 2 and row[2] else ''
+            product_name = str(row[3]).strip() if len(row) > 3 and row[3] else ''
+
+            # Skip the grey example row
+            if 'EXAMPLE' in part_number.upper():
+                continue
+            # A row is valid if it has ANY identifier — part number, URL, or name
+            if not (part_number or product_url or product_name):
+                continue
+
+            products.append({
+                'part_number': part_number,
+                'brand_website': brand_website,
+                'product_url': product_url,
+                'product_name': product_name,
+            })
         if not products:
-            return jsonify({'error': 'No products found. Make sure to delete the grey example rows!'}), 400
+            return jsonify({'error': 'No products found. Make sure to delete the grey example row and fill at least a Part Number, Product Name, or Product URL!'}), 400
         results = []
         for product in products:
             result = scrape_product(product['part_number'], product['brand_website'],
-                                    product['product_url'], selected_fields, custom_fields)
+                                    product['product_url'], product['product_name'],
+                                    selected_fields, custom_fields)
             results.append(result)
         output = create_output_excel(results, selected_fields, custom_fields)
         return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                          as_attachment=True, download_name='Pattern_Scraped_Data.xlsx')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
